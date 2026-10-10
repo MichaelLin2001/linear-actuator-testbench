@@ -12,17 +12,14 @@
 
 ## 1. Linux 编译
 
-需要 C++17 编译器、CMake 3.16+、Python 3、PyYAML、Expect、Bash，以及串口访问权限。以下命令从仓库根目录执行：
+需要 C++17 编译器、CMake 3.16+、Python 3、PyYAML、Expect、Bash，以及串口访问权限。Python 只有 PyYAML 一个第三方依赖，其余模块使用标准库；直接使用电脑上已有的 Python，无需虚拟环境。以下命令从仓库根目录执行：
 
 ```bash
 # Debian/Ubuntu 示例；其他系统安装同等依赖
-sudo apt-get install build-essential cmake python3 python3-venv expect
-python3 -m venv .venv
-. .venv/bin/activate
-python3 -m pip install PyYAML
+sudo apt-get install build-essential cmake python3 python3-yaml expect
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
-  -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
+  -DPython3_EXECUTABLE="$(command -v python3)"
 cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 chmod +x build/jointctl jc_driver_integration/tools/single_j3/*
@@ -31,6 +28,8 @@ chmod +x build/jointctl jc_driver_integration/tools/single_j3/*
 预期测试：`offline_contracts`（共享内存单位、状态机与位置轨迹）、`experiment_contracts`（电流轨迹、测量保护、目标槽位保持和力样本处理）、`yaml_contracts`（配置校验）。这些测试不启动电机或传感器。
 
 CMake 构建把 `jointctl` 复制到 build；修改 Python 工具后需重新执行 CMake 配置，使复制版本更新。只修改 YAML 不需要配置或编译。
+
+非 Debian/Ubuntu 环境，可在已有 Python 中运行 `python3 -m pip install PyYAML`；若提示系统环境受管理，使用系统包管理器安装，不强制覆盖。已经能运行 `python3 -c "import yaml; print(yaml.__version__)"` 就无需重复安装。控制器仍在 Linux 上运行。
 
 ## 2. 原驱动和硬件
 
@@ -92,7 +91,6 @@ cp joint_controller/profiles/experiment.yaml \
 先确认夹具受力路径、机械行程及硬件急停。左侧钢板对应伸长加载，右侧对应收缩加载；换钢板前解除载荷并确认失能。首次只做最低载荷测试。
 
 ```bash
-. .venv/bin/activate
 ./build/jointctl experiment \
   --config joint_controller/profiles/experiment.local.yaml
 ```
