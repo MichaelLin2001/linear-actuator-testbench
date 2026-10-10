@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+
+"""Single operator entry. YAML stays outside the 1 kHz controller."""
+
+import argparse
+
+import concurrent.futures
+
+
+import json
+
+import math
+
+import os
+
+from pathlib import Path
+
+
+import select
+
+import socket
+
+import subprocess
+
+import sys
+
+import threading
+
+import time
+
+import uuid
+
+
+SOCKET = '/tmp/joint_controller.sock'
+
+
+def request(op, args=None, sock=SOCKET):
+
+    payload = dict(version=1, request_id=str(uuid.uuid4()), op=op)
+
+    payload.update(args or {})
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+
+        connection.settimeout(40)
+
+        connection.connect(sock)
+
+        connection.sendall((json.dumps(payload, allow_nan=False) + '\n').encode())
+
+        connection.shutdown(socket.SHUT_WR)
+
+        data = bytearray()
+
+        while True:
+
+            chunk = connection.recv(4096)
+
+            if not chunk:
+
+                break
+
+            data.extend(chunk)
+
+            if len(data) > 65536:
+
+                raise ValueError('oversized controller response')
+
+    return json.loads(data)
+
+
+def urgent(command, sock=SOCKET):
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as connection:
+
+        connection.sendto(command.encode(), sock + '.urgent')
+
+
+SCHEMA = {
+
+    'experiment': ('direction', 'mode', 'max_current_a', 'extend_position_sign'),
+
+    'staircase': ('levels', 'transition_s', 'settle_s', 'record_s'),
+
+    'linear': ('rise_s', 'peak_hold_s', 'fall_s'),
+
+    'preload': ('speed_mm_s', 'contact_force_n', 'contact_confirm_s', 'max_travel_mm', 'timeout_s'),
+
+    'unload': ('current_slew_a_s', 'retract_distance_mm', 'retract_speed_mm_s'),
+
+    'limits': ('current_a', 'force_n', 'position_min_mm', 'position_max_mm', 'velocity_mm_s',
+
+               'contact_displacement_mm', 'force_timeout_ms', 'experiment_timeout_s', 'heartbeat_timeout_s'),
+
+    'sensor': ('device', 'baud'),
+
+    'output': ('directory',),
+
+}
+
+
+def load_config(path):
+
+    try:
+
+        import yaml
+
+    except ImportError as error:
+
+        raise RuntimeError('install PyYAML: python3 -m pip install PyYAML') from error
+
+    class UniqueLoader(yaml.SafeLoader):
+
+        pass
+
+    def unique_mapping(loader, node, deep=False):
+
+        result = {}
+
+        for key_node, value_node in node.value:
+
+            key = loader.construct_object(key_node, deep=deep)
+
+            if not isinstance(key, str) or key in result:
+
+                raise ValueError('duplicate or non-string YAML key: ' + str(key))
+
+            result[key] = loader.construct_object(value_node, deep=deep)
+
+        return result
+
+    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
+
+    path = Path(path).resolve()
+
+    with path.open(encoding='utf-8') as stream:
+
+        try:
+            config = yaml.load(stream, Loader=UniqueLoader)
+        except yaml.YAMLError as error:
+            raise ValueError('invalid or unsafe YAML: '+str(error)) from error
+
+    if not isinstance(config, dict) or set(config) != set(SCHEMA):
+
+        raise ValueError('YAML groups must be exactly: ' + ', '.join(SCHEMA))
+
+    for group, keys in SCHEMA.items():
+
+        values = config[group]
+
+        if not isinstance(values, dict) or set(values) != set(keys):
+
+            raise ValueError(group + ' keys must be exactly: ' + ', '.join(keys))
+
+    for group in SCHEMA:
+
+        for key, value in config[group].items():
+
+            if key in ('direction', 'mode', 'device', 'directory'):
+
+                if not isinstance(value, str) or not value.strip() or any(ord(ch) < 32 for ch in value):
+
+                    raise ValueError(group + '.' + key + ' must be a nonempty string')
+
+                continue
+
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+
+                raise ValueError(group + '.' + key + ' must be a finite number; fill every null safety value')
+
+            signed = key in ('position_min_mm', 'position_max_mm', 'extend_position_sign')
+
+            zero_allowed = key == 'settle_s'
+
+            if not signed and (value < 0 if zero_allowed else value <= 0):
+
+                raise ValueError(group + '.' + key + ' is out of range')
+
+    e, s, l = config['experiment'], config['staircase'], config['limits']
+
+    if e['direction'] not in ('extend', 'retract') or e['mode'] not in ('staircase', 'linear'):
+
+        raise ValueError('direction: extend/retract; mode: staircase/linear')
+
+    if e['extend_position_sign'] not in (-1, 1):
+
+        raise ValueError('extend_position_sign must be verified as +1 or -1')
+
+    if type(s['levels']) is not int or not 1 <= s['levels'] <= 1000:
+
+        raise ValueError('levels must be an integer in 1..1000')
+
+    if e['max_current_a'] > l['current_a'] or l['position_min_mm'] >= l['position_max_mm']:
+
+        raise ValueError('maximum current exceeds limit or position limits are inverted')
+
+    if config['preload']['contact_force_n'] >= l['force_n']:
+
+        raise ValueError('contact threshold must be below force limit')
+
+    if max(config['preload']['speed_mm_s'], config['unload']['retract_speed_mm_s']) > l['velocity_mm_s']:
+
+        raise ValueError('requested speed exceeds velocity limit')
+
+    if l['contact_displacement_mm'] > config['preload']['max_travel_mm']:
+
+        raise ValueError('contact displacement must not exceed search travel')
+
+    if not 0 < l['force_timeout_ms'] <= 1000 or not 0 < l['heartbeat_timeout_s'] <= 5:
+
+        raise ValueError('force timeout <= 1000 ms and heartbeat timeout <= 5 s required')
+
+    if type(config['sensor']['baud']) is not int or config['sensor']['baud'] not in (115200,230400,460800,921600):
+
+        raise ValueError('unsupported serial baud')
+
+    device = config['sensor']['device']
+
+    if '"' in device or '\\' in device:
+
+        raise ValueError('serial device cannot contain quotes or backslashes')
+
+    # Paths in YAML always resolve relative to that YAML, not the shell cwd.
+
+    for group, key in (('sensor','device'), ('output','directory')):
+
+        value = Path(config[group][key]).expanduser()
+
+        config[group][key] = str((path.parent / value).resolve() if not value.is_absolute() else value.resolve())
+
+    return config
+
+
+def controller_config(c):
+
+    e, s, lin, p, u, lim = (c[k] for k in ('experiment','staircase','linear','preload','unload','limits'))
+
+    sign = e['extend_position_sign'] * (1 if e['direction']=='extend' else -1)
+
+    return dict(direction=sign, mode=e['mode'], max_current_a=e['max_current_a'], **s, **lin,
+
+        preload_speed=p['speed_mm_s']*.001, contact_force_n=p['contact_force_n'], contact_confirm_s=p['contact_confirm_s'],
+
+        max_travel=p['max_travel_mm']*.001, preload_timeout_s=p['timeout_s'], unload_slew_a_s=u['current_slew_a_s'],
+
+        retract_distance=u['retract_distance_mm']*.001, retract_speed=u['retract_speed_mm_s']*.001,
+
+        current_limit_a=lim['current_a'], force_limit_n=lim['force_n'], position_min=lim['position_min_mm']*.001,
+
+        position_max=lim['position_max_mm']*.001, velocity_limit=lim['velocity_mm_s']*.001,
+
+        contact_displacement=lim['contact_displacement_mm']*.001, force_timeout_s=lim['force_timeout_ms']*.001,
+
+        experiment_timeout_s=lim['experiment_timeout_s'], heartbeat_timeout_s=lim['heartbeat_timeout_s'])
+
+
+def preview(config, destination, initial=0.0):
+    """Use the same C++ trajectory as the controller, before any hardware startup."""
+    binary=Path(__file__).resolve().parent/'joint_controller'
+    if not binary.is_file():
+        raise RuntimeError('compile first and use build/jointctl for offline preview')
+    result=subprocess.run([str(binary),'--preview',str(Path(destination).resolve()),
+        '--preview-initial-a',str(initial)],input=json.dumps(controller_config(config),allow_nan=False)+'\n',
+        text=True,capture_output=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'offline preview failed')
+    return result.stdout.strip()
+
+
+def start(config):
+
+    if Path(SOCKET).exists() or Path(SOCKET+'.urgent').exists():
+
+        raise RuntimeError('socket exists; do not attach to an unknown session; stop it first')
+
+    directory=Path(config['output']['directory']);directory.mkdir(parents=True,exist_ok=True)
+
+    stem='experiment_'+time.strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:8]
+
+    csv_path=directory/(stem+'.csv')
+
+    binary=Path(__file__).resolve().parent/'joint_controller'
+
+    if not binary.is_file():
+
+        raise RuntimeError('run the built build/jointctl after compiling, not tools/jointctl')
+
+    with (directory/(stem+'.daemon.log')).open('xb') as log:
+
+        process=subprocess.Popen([str(binary),'--enable-output','--serve','--csv',str(csv_path),
+
+            '--sensor-device',config['sensor']['device'],'--sensor-baud',str(config['sensor']['baud'])],
+
+            stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+
+    for _ in range(100):
+
+        if process.poll() is not None:
+
+            raise RuntimeError('controller exited; inspect '+str(directory/(stem+'.daemon.log')))
+
+        if Path(SOCKET).exists() and Path(SOCKET+'.urgent').exists():
+
+            try:
+
+                response=request('status')
+
+                if response['ok']:
+
+                    return process,csv_path
+
+            except (OSError,ValueError):
+
+                pass
+
+        time.sleep(.1)
+
+    process.terminate()
+
+    raise RuntimeError('controller startup timeout; inspect daemon log')
+
+
+def terminal(path):
+
+    if os.name!='posix' or not sys.stdin.isatty():
+
+        raise RuntimeError('interactive experiments require a Linux terminal')
+
+    import termios
+
+    import tty
+
+    import yaml
+
+    config=load_config(path)
+
+    process,csv_path=start(config)
+
+    beat_done=threading.Event()
+
+    def beats():
+
+        while not beat_done.wait(.1):
+
+            try:urgent('H')
+
+            except OSError:pass
+
+    beat_thread=threading.Thread(target=beats,daemon=True);beat_thread.start()
+
+    original=termios.tcgetattr(sys.stdin)
+
+    pool=concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    pending=None; latest={}; message=''; quitting=False; zero_pending=False; candidate_config=None
+
+    try:
+
+        configured=request('configure',controller_config(config))
+
+        if not configured['ok']:raise RuntimeError(configured['message'])
+
+        tty.setcbreak(sys.stdin)
+
+        print('c配置 z清零 p预加载 s加载 u卸载 空格/Esc急停 r复位 q退出',flush=True)
+
+        print('CURRENT OUTPUT LOCKED：当前版本不发送电流；s会返回明确拒绝。',flush=True)
+
+        print('CSV: '+str(csv_path),flush=True)
+
+        next_status=0.0
+
+        while process.poll() is None:
+
+            if pending and pending.done():
+
+                response=pending.result();pending=None;latest=response;message=response.get('message','')
+
+                if candidate_config is not None:
+
+                    if response.get('ok'):config=candidate_config
+
+                    candidate_config=None
+
+                if zero_pending:
+
+                    if response.get('ok'):message='正在采集清零样本；等 zeroed=true 再按 p'
+
+                    zero_pending=False
+
+            if quitting and not pending:
+
+                if latest.get('stage') in ('COMPLETE','IDLE') or latest.get('driver_disabled_confirmed'):
+
+                    pending=pool.submit(request,'shutdown');quitting=False;message='退出中'
+
+                elif latest.get('state')=='FAULT':
+
+                    quitting=False;message='故障停止未确认，请按急停并检查驱动；不能假装已退出'
+
+            ready,_,_=select.select([sys.stdin],[],[],.05)
+
+            if ready:
+
+                key=sys.stdin.read(1)
+
+                if not key or key in (' ','\x1b','\x03'):
+
+                    urgent('E');message='急停已请求，等待驱动确认；不会自动退回'
+
+                elif key=='q':
+
+                    if not pending:
+
+                        if latest.get('stage') in ('READY','PRELOAD'):
+
+                            pending=pool.submit(request,'unload');quitting=True
+
+                        elif latest.get('stage')=='RETRACT':quitting=True
+
+                        elif latest.get('stage') in ('IDLE','COMPLETE') or latest.get('driver_disabled_confirmed'):
+
+                            pending=pool.submit(request,'shutdown')
+
+                        else:message='仍受载或停止未确认，请先急停并检查'
+
+                elif not pending and key=='c':
+
+                    if latest.get('state')!='IDLE':message='只允许失能后的IDLE重读；先卸载、停止、复位'
+
+                    else:
+
+                        candidate=load_config(path)
+
+                        if candidate['sensor']!=config['sensor'] or candidate['output']!=config['output']:
+
+                            message='设备或输出位置改变，需要退出后重启'
+
+                        else:
+
+                            candidate_config=candidate
+
+                            pending=pool.submit(request,'configure',controller_config(candidate))
+
+                            message='正在重读 '+json.dumps(candidate['experiment'],ensure_ascii=False)
+
+                elif not pending and key in ('z','p','s','u','r'):
+
+                    if key=='p':
+
+                        snapshot=csv_path.with_name(csv_path.stem+'.config.'+uuid.uuid4().hex[:8]+'.yaml')
+
+                        with snapshot.open('x',encoding='utf-8') as stream:yaml.safe_dump(config,stream,allow_unicode=True,sort_keys=False)
+
+                    zero_pending=key=='z'
+
+                    pending=pool.submit(request,{'z':'force-zero','p':'preload','s':'experiment-start','u':'unload','r':'reset'}[key])
+
+            if not pending and time.monotonic()>=next_status:
+
+                pending=pool.submit(request,'status');next_status=time.monotonic()+.1
+
+            if latest:
+
+                line=(f"{latest.get('state')} {latest.get('stage')} fault={latest.get('fault')} "
+
+                    f"x={latest.get('position_mm',0):.3f}mm v={latest.get('velocity_mm_s',0):.3f}mm/s "
+
+                    f"F={latest.get('force_n',0):.2f}N raw={latest.get('force_raw_n',0):.2f}N "
+
+                    f"effort={latest.get('effort',0):.3f} Icmd=0A Iactual=NA "
+
+                    f"zeroed={latest.get('zeroed')} age={latest.get('force_age_ms',0):.1f}ms "
+
+                    f"rx={latest.get('receive_hz',0):.1f}Hz disabled={latest.get('driver_disabled_confirmed')} | {message}")
+
+                print('\r\x1b[2K'+line,end='',flush=True)
+
+        print('\ncontroller exited; inspect summary and daemon log')
+
+    finally:
+
+        try:urgent('E')
+
+        except OSError:pass
+
+        termios.tcsetattr(sys.stdin,termios.TCSADRAIN,original)
+
+        beat_done.set();beat_thread.join(timeout=1)
+
+        pool.shutdown(wait=True,cancel_futures=True)
+
+
+def main():
+
+    parser=argparse.ArgumentParser(description=__doc__)
+
+    sub=parser.add_subparsers(dest='op',required=True)
+
+    exp=sub.add_parser('experiment');exp.add_argument('--config',required=True)
+
+    options=exp.add_mutually_exclusive_group();options.add_argument('--check-config',action='store_true');options.add_argument('--preview',metavar='CSV')
+
+    exp.add_argument('--preview-initial-a',type=float,default=0)
+
+    for op in ('status','force','force-zero','preload','unload','reset','disable','shutdown','estop'):
+
+        sub.add_parser(op)
+
+    args=parser.parse_args()
+
+    try:
+
+        if args.op=='experiment':
+
+            if args.check_config:print(json.dumps(controller_config(load_config(args.config)),indent=2,allow_nan=False))
+
+            elif args.preview:print(preview(load_config(args.config),args.preview,args.preview_initial_a))
+
+            else:terminal(args.config)
+
+            return 0
+
+        if args.op=='estop':urgent('E');print('急停已请求；用 status 检查驱动确认');return 0
+
+        response=request(args.op);print(json.dumps(response,indent=2,ensure_ascii=False));return 0 if response['ok'] else 2
+
+    except (OSError,ValueError,RuntimeError) as error:
+
+        print(str(error),file=sys.stderr);return 2
+
+
+if __name__=='__main__':
+
+    sys.exit(main())

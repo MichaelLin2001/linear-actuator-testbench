@@ -1,0 +1,41 @@
+#!/usr/bin/expect -f
+set timeout 1
+set runtime_dir "/tmp/jc_driver_single_j3"
+set command_file "$runtime_dir/command"
+set session_log "$runtime_dir/session.log"
+set driver_binary "/home/nvidia/Documents/jc_driver/artifacts/single_j3_stage1_final/jc01/bin/motor_test"
+set fallback_binary "/home/nvidia/Documents/joint_controller/build/jc_driver_j3_single"
+
+if {[info exists env(JC_DRIVER_USE_FALLBACK)] && $env(JC_DRIVER_USE_FALLBACK) eq "1"} {
+    set driver_binary $fallback_binary
+}
+if {![file executable $driver_binary]} {
+    puts stderr "driver binary is not executable: $driver_binary"
+    exit 2
+}
+
+file mkdir $runtime_dir
+file delete -force $command_file
+cd $runtime_dir
+log_file -a $session_log
+spawn -noecho $driver_binary
+
+while {1} {
+    expect {
+        -re {\[Command\] >} {}
+        timeout {}
+        eof {
+            set result [wait]
+            exit [lindex $result 3]
+        }
+    }
+    if {[file exists $command_file]} {
+        set input [open $command_file r]
+        set command [string trim [read $input]]
+        close $input
+        file delete -force $command_file
+        if {$command ne ""} {
+            send -- "$command\r"
+        }
+    }
+}

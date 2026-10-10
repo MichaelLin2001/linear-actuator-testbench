@@ -1,0 +1,40 @@
+# Fill null values from the actual installation before use. No guessed hardware limits.
+experiment:
+  direction: extend
+  mode: staircase
+  max_current_a: null
+  extend_position_sign: null  # +1 or -1, verified using a small safe motion
+staircase:
+  levels: 5
+  transition_s: 1.0
+  settle_s: 1.0
+  record_s: 3.0
+linear:
+  rise_s: 10.0
+  peak_hold_s: 3.0
+  fall_s: 10.0
+preload:
+  speed_mm_s: null
+  contact_force_n: null
+  contact_confirm_s: 0.3
+  max_travel_mm: null
+  timeout_s: null
+unload:
+  current_slew_a_s: null
+  retract_distance_mm: null
+  retract_speed_mm_s: null
+limits:
+  current_a: null
+  force_n: null
+  position_min_mm: null
+  position_max_mm: null
+  velocity_mm_s: null
+  contact_displacement_mm: null
+  force_timeout_ms: 100
+  experiment_timeout_s: null
+  heartbeat_timeout_s: 1.0
+sensor:
+  device: /dev/ttyUSB0
+  baud: 115200
+output:
+  directory: ../../logs

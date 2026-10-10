@@ -1,0 +1,22 @@
+# Build and Python cache
+**/build*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/__pycache__/
+*.py[cod]
+.venv/
+
+# Experimental output and machine-specific settings
+**/logs/
+/data/
+*.csv
+*.log
+*.local.yaml
+.env
+.env.*
+
+# Editor and OS state
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

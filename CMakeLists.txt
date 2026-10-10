@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+project(linear_actuator_testbench LANGUAGES CXX)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+include(CTest)
+add_subdirectory(joint_controller)
