@@ -21,7 +21,7 @@ public:
 
     bool start(const std::string& path, const LoopConfig& config, std::string& error);
     CycleRecord* reserve_record() noexcept;
-    void publish_record() noexcept { records_->publish(); }
+    void publish_record() noexcept { records_->publish(); producing_.store(false); }
     void finish(const LoopSummary& summary);
     std::uint64_t dropped_records() const noexcept { return dropped_.load(std::memory_order_relaxed); }
     int io_error() const noexcept { return io_error_.load(std::memory_order_relaxed); }
@@ -33,7 +33,7 @@ private:
     std::unique_ptr<char[]> file_buffer_;
     std::atomic<std::uint64_t> dropped_{};
     std::atomic<int> io_error_{};
-    std::atomic<bool> finish_requested_{};
+    std::atomic<bool> finish_requested_{}, active_{}, producing_{};
     std::thread thread_;
     std::mutex startup_mutex_;
     std::condition_variable startup_cv_;

@@ -202,10 +202,10 @@ void ForceSensorReader::reader_loop() noexcept {
             }
             break;
         }
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            break;
+        }
         if (poll_result == 0 || (descriptor.revents & POLLIN) == 0) {
-            if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-                break;
-            }
             continue;
         }
 

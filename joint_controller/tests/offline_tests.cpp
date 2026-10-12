@@ -7,6 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include "comm_message.h"
+static_assert(sizeof(MHandle) == 16);
+static_assert(sizeof(MHandle) * 30 == 480);
 
 namespace {
 void check(bool condition, const char* expression, int line) {

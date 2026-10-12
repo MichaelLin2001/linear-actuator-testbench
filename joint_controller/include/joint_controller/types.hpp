@@ -60,11 +60,11 @@ enum class Fault : std::uint8_t {
     None, ConsecutiveReadFailures, SnapshotTimeout, NonFiniteFeedback,
     SemaphoreRelease, Clock, Sleep, Logger, TrackingError, TargetWrite, ForceSensor, ExperimentSafety, EmergencyStop, Heartbeat
 };
-enum class CommandType : std::uint8_t { None, Arm, Run, Stop, Reset, Move, ForceZero, Configure, Preload, Unload };
+enum class CommandType : std::uint8_t { None, Arm, Run, Stop, Reset, Move, ForceZero, Configure, Preload, Unload, BeginLoad, CommitLoad, ResumeCsp };
 enum class CommandResult : std::uint8_t {
     None, Accepted, RejectedState, RejectedFeedback, RejectedVelocity, RejectedArgument
 };
-enum class ControlMode : std::uint8_t { ReadOnlyDryRun, CspBuiltin };
+enum class ControlMode : std::uint8_t { ReadOnlyDryRun, CspBuiltin, CstRaw };
 enum class MotionPhase : std::uint8_t {
     Idle, InitialHold, Outbound, TargetHold, Return, FinalHold, Complete, Stopped
 };
@@ -185,13 +185,15 @@ struct CycleRecord {
     double submitted_csp_position{};
     double tracking_error{};
     std::uint64_t target_write_failures{};
+    std::uint64_t heartbeat_timestamp_ns{},heartbeat_check_timestamp_ns{};
+    std::uint64_t force_read_timestamp_ns{};
     ProcessedForce force{};
     ExperimentStage experiment_stage{ExperimentStage::Idle};
     std::uint64_t experiment_id{};
     unsigned experiment_level{};
     int experiment_direction{};
     bool actual_current_valid{};
-    double commanded_current_a{}, actual_current_a{};
+    double commanded_current_raw{}, actual_current_raw{};
 
 };
 static_assert(std::is_trivially_copyable<CycleRecord>::value);

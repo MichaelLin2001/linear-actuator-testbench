@@ -5,6 +5,7 @@ class OutputManager {
 public:
     explicit OutputManager(JcTargetAdapter& adapter) noexcept : adapter_(adapter) {}
     TargetWriteStatus write_csp(double position) noexcept;
+    TargetWriteStatus write_cst(double raw) noexcept;
     double last_submitted() const noexcept { return last_submitted_; }
     bool has_submitted() const noexcept { return has_submitted_; }
     std::uint64_t failures() const noexcept { return failures_; }

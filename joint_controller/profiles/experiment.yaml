@@ -1,9 +1,11 @@
-# Fill null values from the actual installation before use. No guessed hardware limits.
+# 完整示例参数，尚未按实机标定；运行 p 前核对方向、绝对行程和载荷限值。
+# CST 参数为驱动原始单位，非 A；s 将执行实际加载。峰值 10 raw，保护上限 20 raw。
 experiment:
   direction: extend
   mode: staircase
-  max_current_a: null
-  extend_position_sign: null  # +1 or -1, verified using a small safe motion
+  position_mode: relative
+  max_current_raw: 10.0
+  extend_position_sign: 1  # +1 or -1, verified using a small safe motion
 staircase:
   levels: 5
   transition_s: 1.0
@@ -14,24 +16,24 @@ linear:
   peak_hold_s: 3.0
   fall_s: 10.0
 preload:
-  speed_mm_s: null
-  contact_force_n: null
-  contact_confirm_s: 0.3
-  max_travel_mm: null
-  timeout_s: null
+  speed_mm_s: 1
+  contact_force_n: 5.0
+  contact_confirm_s: 0.2
+  max_travel_mm: 10.0
+  timeout_s: 300.0
 unload:
-  current_slew_a_s: null
-  retract_distance_mm: null
-  retract_speed_mm_s: null
+  current_slew_raw_s: 5.0
+  retract_distance_mm: 1.0
+  retract_speed_mm_s: 0.5
 limits:
-  current_a: null
-  force_n: null
-  position_min_mm: null
-  position_max_mm: null
-  velocity_mm_s: null
-  contact_displacement_mm: null
+  current_raw: 20.0
+  force_n: 100.0
+  position_min_mm: 0.0
+  position_max_mm: 50.0
+  velocity_mm_s: 3.0
+  contact_displacement_mm: 1.0
   force_timeout_ms: 100
-  experiment_timeout_s: null
+  experiment_timeout_s: 300.0
   heartbeat_timeout_s: 1.0
 sensor:
   device: /dev/ttyUSB0

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -16,10 +17,10 @@
 
 namespace jc {
 namespace {
-constexpr const char* kStart = "/home/nvidia/Documents/jc_driver/tools/single_j3/start_driver.sh";
-constexpr const char* kSend = "/home/nvidia/Documents/jc_driver/tools/single_j3/send_command.sh";
-constexpr const char* kLog = "/tmp/jc_driver_single_j3/session.log";
-constexpr const char* kLauncherLog = "/tmp/jc_driver_single_j3/stage2_launcher.log";
+std::string sibling_script(const char* name) {
+    return (std::filesystem::read_symlink("/proc/self/exe").parent_path() / name).string();
+}
+constexpr const char* kLog = "/tmp/j3-testbench/session.log";
 std::size_t file_size(const char* path) { struct stat st{}; return stat(path, &st) == 0 ? static_cast<std::size_t>(st.st_size) : 0; }
 std::string read_from(const char* path, std::size_t offset) {
     std::ifstream in(path); if (!in) return {}; in.seekg(static_cast<std::streamoff>(offset));
@@ -45,31 +46,20 @@ std::string last_statusword(const std::string& text) {
 }
 }
 DriverManager::~DriverManager() {
-    if (session_pid_ > 0) {
-        std::string error;
-        if(disable(error).state_confirmed) shutdown(error);
-        else std::cerr << "STOP NOT CONFIRMED; keep driver available for manual stop: " << error << '\n';
+    if(session_pid_>0){std::string error;
+        if(!disable(error).state_confirmed)std::cerr<<"STOP NOT CONFIRMED: "<<error<<'\n';
     }
 }
 bool DriverManager::start(std::string& error) {
-    if (session_pid_ > 0) return true;
-    const auto offset = file_size(kLog);
-    const pid_t pid = fork();
-    if (pid < 0) { error = std::string("fork driver: ") + std::strerror(errno); return false; }
-    if (pid == 0) {
-        const int fd = open(kLauncherLog, O_WRONLY|O_CREAT|O_APPEND, 0644);
-        if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
-        execl(kStart, kStart, static_cast<char*>(nullptr)); _exit(127);
-    }
-    session_pid_ = pid;
-    for (unsigned i=0; i<120; ++i) {
-        int status{}; if (waitpid(pid, &status, WNOHANG) == pid) {
-            session_pid_ = -1; error = "jc_driver launcher exited before command prompt"; return false;
-        }
-        if (read_from(kLog, offset).find("[Command] >") != std::string::npos) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    error = "timeout waiting for jc_driver command prompt"; return false;
+    std::ifstream pidfile("/tmp/j3-testbench/motor.pid");
+    pid_t pid=-1;pidfile>>pid;
+    if(pid<=0||kill(pid,0)!=0){error="start terminal 1 with sudo ./motor_test first";return false;}
+    std::error_code ec;
+    const auto executable=std::filesystem::read_symlink("/proc/"+std::to_string(pid)+"/exe",ec);
+    if(ec||executable.filename()!="motor_test"){error="driver PID is stale";return false;}
+    session_pid_=pid;
+    if(!query(error).state_confirmed){session_pid_=-1;return false;}
+    return true;
 }
 bool DriverManager::send(const std::string& command, std::string& response, std::string& error,
                          unsigned timeout_seconds) {
@@ -77,7 +67,7 @@ bool DriverManager::send(const std::string& command, std::string& response, std:
     if(stop_requested_.load()&&!stop_command){error="command cancelled by emergency stop";return false;}
     if (session_pid_ <= 0 || kill(session_pid_, 0) != 0) { error = "managed jc_driver is not running"; return false; }
     const auto offset = file_size(kLog);
-    if (!run_wait(kSend, command, error)) return false;
+    if (!run_wait(sibling_script("send_command.sh").c_str(), command, error)) return false;
     const unsigned polls = timeout_seconds * 20;
     for (unsigned i=0; i<polls; ++i) {
         if(stop_requested_.load()&&!stop_command){error="command interrupted by emergency stop";return false;}
@@ -89,11 +79,7 @@ bool DriverManager::send(const std::string& command, std::string& response, std:
             const auto next_prompt = response.find("[Command] >", command_at + command.size());
             if (next_prompt != std::string::npos || command == "quit") return true;
         }
-        int status{}; if (waitpid(session_pid_, &status, WNOHANG) == session_pid_) {
-            session_pid_ = -1;
-            if (command == "quit") return true;
-            error = "jc_driver exited while processing command"; return false;
-        }
+        if(kill(session_pid_,0)!=0){session_pid_=-1;error="driver session exited";return false;}
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     error = "timeout waiting for jc_driver response to: " + command; return false;
@@ -132,12 +118,12 @@ DriverStatus DriverManager::query(std::string& error) {
 DriverStatus DriverManager::enable(std::string& error) {
     std::string response;
     DriverStatus result{};
-    if (!send("AppM18Enable RESET CONFIRM", response, error)) return result;
+    if (!send("AppM18Enable RESET", response, error)) return result;
     result.command_sent = true;
     // The verified stage-1 sequence allowed the M18 node five seconds to
     // finish NMT reset before remapping PDOs and starting guarded enable.
     std::this_thread::sleep_for(std::chrono::seconds(5));
-    if (!send("AppM18Enable EN_DRV CONFIRM", response, error)) return result;
+    if (!send("AppM18Enable EN_DRV", response, error)) return result;
     auto checked = query(error); checked.command_sent = true;
     if (!checked.operation_enabled || checked.mode_display != 8) { error = "drive did not confirm Operation enabled with mode 8"; return checked; }
     if (!send("AppStart POS", response, error)) return checked;
@@ -145,6 +131,22 @@ DriverStatus DriverManager::enable(std::string& error) {
     checked.state_confirmed = checked.operation_enabled && checked.mode_display == 8;
     if (!checked.state_confirmed) error = "post-AppStart status confirmation failed";
     return checked;
+}
+DriverStatus DriverManager::load_raw(int initial,int limit,std::string& error){
+    std::string response;
+    if(!send("AppM18LoadRaw "+std::to_string(initial)+" "+std::to_string(limit),response,error))return {};
+    if(response.find("RAW_CST_READY ")==std::string::npos){error="driver rejected raw CST handover: "+response;return {};}
+    auto status=query(error);status.state_confirmed=status.operation_enabled&&status.mode_display==10;
+    if(!status.state_confirmed)error="drive did not confirm enabled CST mode 10";
+    return status;
+}
+DriverStatus DriverManager::hold_csp(std::string& error){
+    std::string response;
+    if(!send("AppM18CspHold",response,error))return {};
+    if(response.find("RAW_CSP_READY")==std::string::npos){error="driver rejected CSP handover: "+response;return {};}
+    auto status=query(error);status.state_confirmed=status.operation_enabled&&status.mode_display==8;
+    if(!status.state_confirmed)error="drive did not confirm enabled CSP mode 8";
+    return status;
 }
 DriverStatus DriverManager::stop_application(std::string& error) {
     std::string response; DriverStatus s{};
@@ -161,13 +163,8 @@ DriverStatus DriverManager::disable(std::string& error) {
     return s;
 }
 bool DriverManager::shutdown(std::string& error) {
-    if (session_pid_ <= 0) return true;
-    std::string response; const pid_t pid = session_pid_;
-    if (!send("quit", response, error, 8)) return false;
-    for (unsigned i=0; i<80; ++i) {
-        int status{}; if (waitpid(pid, &status, WNOHANG) == pid) { session_pid_ = -1; return true; }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    error = "timeout waiting for managed jc_driver shutdown"; return false;
+    if(session_pid_<=0)return true;
+    if(!disable(error).state_confirmed)return false;
+    session_pid_=-1;return true;
 }
 }  // namespace jc

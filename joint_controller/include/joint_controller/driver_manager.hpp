@@ -24,6 +24,8 @@ public:
     bool start(std::string& error);
     DriverStatus query(std::string& error);
     DriverStatus enable(std::string& error);
+    DriverStatus load_raw(int initial,int limit,std::string& error);
+    DriverStatus hold_csp(std::string& error);
     DriverStatus stop_application(std::string& error);
     DriverStatus disable(std::string& error);
     bool shutdown(std::string& error);

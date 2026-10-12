@@ -18,6 +18,8 @@ from pathlib import Path
 
 import select
 
+import signal
+
 import socket
 
 import subprocess
@@ -31,7 +33,7 @@ import time
 import uuid
 
 
-SOCKET = '/tmp/joint_controller.sock'
+SOCKET = '/tmp/j3-testbench/controller.sock'
 
 
 def request(op, args=None, sock=SOCKET):
@@ -78,7 +80,7 @@ def urgent(command, sock=SOCKET):
 
 SCHEMA = {
 
-    'experiment': ('direction', 'mode', 'max_current_a', 'extend_position_sign'),
+    'experiment': ('direction', 'mode', 'position_mode', 'max_current_raw', 'extend_position_sign'),
 
     'staircase': ('levels', 'transition_s', 'settle_s', 'record_s'),
 
@@ -86,9 +88,9 @@ SCHEMA = {
 
     'preload': ('speed_mm_s', 'contact_force_n', 'contact_confirm_s', 'max_travel_mm', 'timeout_s'),
 
-    'unload': ('current_slew_a_s', 'retract_distance_mm', 'retract_speed_mm_s'),
+    'unload': ('current_slew_raw_s', 'retract_distance_mm', 'retract_speed_mm_s'),
 
-    'limits': ('current_a', 'force_n', 'position_min_mm', 'position_max_mm', 'velocity_mm_s',
+    'limits': ('current_raw', 'force_n', 'position_min_mm', 'position_max_mm', 'velocity_mm_s',
 
                'contact_displacement_mm', 'force_timeout_ms', 'experiment_timeout_s', 'heartbeat_timeout_s'),
 
@@ -144,6 +146,9 @@ def load_config(path):
 
         raise ValueError('YAML groups must be exactly: ' + ', '.join(SCHEMA))
 
+    if isinstance(config.get('experiment'), dict):
+        config['experiment'].setdefault('position_mode', 'relative')
+
     for group, keys in SCHEMA.items():
 
         values = config[group]
@@ -156,7 +161,7 @@ def load_config(path):
 
         for key, value in config[group].items():
 
-            if key in ('direction', 'mode', 'device', 'directory'):
+            if key in ('direction', 'mode', 'position_mode', 'device', 'directory'):
 
                 if not isinstance(value, str) or not value.strip() or any(ord(ch) < 32 for ch in value):
 
@@ -178,6 +183,9 @@ def load_config(path):
 
     e, s, l = config['experiment'], config['staircase'], config['limits']
 
+    if e['position_mode'] not in ('relative', 'absolute'):
+        raise ValueError('position_mode: relative/absolute')
+
     if e['direction'] not in ('extend', 'retract') or e['mode'] not in ('staircase', 'linear'):
 
         raise ValueError('direction: extend/retract; mode: staircase/linear')
@@ -190,7 +198,10 @@ def load_config(path):
 
         raise ValueError('levels must be an integer in 1..1000')
 
-    if e['max_current_a'] > l['current_a'] or l['position_min_mm'] >= l['position_max_mm']:
+    if not (float(e['max_current_raw']).is_integer() and float(l['current_raw']).is_integer()) or l['current_raw'] > 32767:
+        raise ValueError('raw peak and limit must be integers in 1..32767')
+
+    if e['max_current_raw'] > l['current_raw'] or l['position_min_mm'] >= l['position_max_mm']:
 
         raise ValueError('maximum current exceeds limit or position limits are inverted')
 
@@ -237,15 +248,15 @@ def controller_config(c):
 
     sign = e['extend_position_sign'] * (1 if e['direction']=='extend' else -1)
 
-    return dict(direction=sign, mode=e['mode'], max_current_a=e['max_current_a'], **s, **lin,
+    return dict(direction=sign, mode=e['mode'], position_mode=e.get('position_mode','relative'), max_current_raw=e['max_current_raw'], **s, **lin,
 
         preload_speed=p['speed_mm_s']*.001, contact_force_n=p['contact_force_n'], contact_confirm_s=p['contact_confirm_s'],
 
-        max_travel=p['max_travel_mm']*.001, preload_timeout_s=p['timeout_s'], unload_slew_a_s=u['current_slew_a_s'],
+        max_travel=p['max_travel_mm']*.001, preload_timeout_s=p['timeout_s'], unload_slew_raw_s=u['current_slew_raw_s'],
 
         retract_distance=u['retract_distance_mm']*.001, retract_speed=u['retract_speed_mm_s']*.001,
 
-        current_limit_a=lim['current_a'], force_limit_n=lim['force_n'], position_min=lim['position_min_mm']*.001,
+        current_limit_raw=lim['current_raw'], force_limit_n=lim['force_n'], position_min=lim['position_min_mm']*.001,
 
         position_max=lim['position_max_mm']*.001, velocity_limit=lim['velocity_mm_s']*.001,
 
@@ -258,13 +269,38 @@ def preview(config, destination, initial=0.0):
     """Use the same C++ trajectory as the controller, before any hardware startup."""
     binary=Path(__file__).resolve().parent/'joint_controller'
     if not binary.is_file():
-        raise RuntimeError('compile first and use build/jointctl for offline preview')
+        raise RuntimeError('compile first and use build/bin/jointctl for offline preview')
     result=subprocess.run([str(binary),'--preview',str(Path(destination).resolve()),
-        '--preview-initial-a',str(initial)],input=json.dumps(controller_config(config),allow_nan=False)+'\n',
+        '--preview-initial-raw',str(initial)],input=json.dumps(controller_config(config),allow_nan=False)+'\n',
         text=True,capture_output=True)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or 'offline preview failed')
     return result.stdout.strip()
+
+
+def stop_controller(process):
+    # Wait for the owned controller to disable, drain logs and remove its sockets.
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in signals}
+    try:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+        try:
+            code = process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f'controller PID {process.pid} has not exited; stop is unconfirmed; inspect daemon log. Do not delete its sockets.') from None
+        if code != 0:
+            raise RuntimeError(f'controller exited with code {code}; inspect daemon log and confirm drive state')
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def interrupt_terminal(signum, frame):
+    raise KeyboardInterrupt
 
 
 def start(config):
@@ -283,41 +319,44 @@ def start(config):
 
     if not binary.is_file():
 
-        raise RuntimeError('run the built build/jointctl after compiling, not tools/jointctl')
+        raise RuntimeError('run the built build/bin/jointctl after compiling, not tools/jointctl')
 
     with (directory/(stem+'.daemon.log')).open('xb') as log:
 
         process=subprocess.Popen([str(binary),'--enable-output','--serve','--csv',str(csv_path),
 
-            '--sensor-device',config['sensor']['device'],'--sensor-baud',str(config['sensor']['baud'])],
+            ],
 
             stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
 
-    for _ in range(100):
+    try:
+        for _ in range(100):
 
-        if process.poll() is not None:
+            if process.poll() is not None:
 
-            raise RuntimeError('controller exited; inspect '+str(directory/(stem+'.daemon.log')))
+                raise RuntimeError('controller exited; inspect '+str(directory/(stem+'.daemon.log')))
 
-        if Path(SOCKET).exists() and Path(SOCKET+'.urgent').exists():
+            if Path(SOCKET).exists() and Path(SOCKET+'.urgent').exists():
 
-            try:
+                try:
 
-                response=request('status')
+                    response=request('status')
 
-                if response['ok']:
+                    if response['ok']:
 
-                    return process,csv_path
+                        return process,csv_path
 
-            except (OSError,ValueError):
+                except (OSError,ValueError):
 
-                pass
+                    pass
 
-        time.sleep(.1)
+            time.sleep(.1)
 
-    process.terminate()
+        raise RuntimeError('controller startup timeout; inspect daemon log')
 
-    raise RuntimeError('controller startup timeout; inspect daemon log')
+    except BaseException:
+        stop_controller(process)
+        raise
 
 
 def terminal(path):
@@ -334,6 +373,8 @@ def terminal(path):
 
     config=load_config(path)
 
+    original=termios.tcgetattr(sys.stdin)
+
     process,csv_path=start(config)
 
     beat_done=threading.Event()
@@ -346,15 +387,16 @@ def terminal(path):
 
             except OSError:pass
 
-    beat_thread=threading.Thread(target=beats,daemon=True);beat_thread.start()
+    beat_thread=threading.Thread(target=beats,daemon=True)
 
-    original=termios.tcgetattr(sys.stdin)
+    pool=None
 
-    pool=concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-    pending=None; latest={}; message=''; quitting=False; zero_pending=False; candidate_config=None
+    pending=None; pending_op=None; latest={}; message=''; quitting=False; shutdown_requested=False; candidate_config=None
 
     try:
+
+        beat_thread.start()
+        pool=concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         configured=request('configure',controller_config(config))
 
@@ -362,19 +404,25 @@ def terminal(path):
 
         tty.setcbreak(sys.stdin)
 
-        print('c配置 z清零 p预加载 s加载 u卸载 空格/Esc急停 r复位 q退出',flush=True)
+        print('c配置 p预加载 s加载 u卸载 空格/Esc急停 r复位 q退出（调零在力传终端）',flush=True)
 
-        print('CURRENT OUTPUT LOCKED：当前版本不发送电流；s会返回明确拒绝。',flush=True)
+        print('s 执行实际 CST 加载：指令/反馈为原始单位，不是 A；u 降到零后切回位置模式退离。',flush=True)
 
-        print('CSV: '+str(csv_path),flush=True)
+        print('正式记录从预紧开始；输出前缀: '+str(csv_path),flush=True)
 
         next_status=0.0
+        next_display=0.0
 
         while process.poll() is None:
 
             if pending and pending.done():
 
-                response=pending.result();pending=None;latest=response;message=response.get('message','')
+                response=pending.result();pending=None;latest=response
+                if pending_op!='status':message=pending_op+': '+response.get('message','')
+                pending_op=None
+                if shutdown_requested and response.get('ok'):
+                    break
+                shutdown_requested=False
 
                 if candidate_config is not None:
 
@@ -382,17 +430,14 @@ def terminal(path):
 
                     candidate_config=None
 
-                if zero_pending:
-
-                    if response.get('ok'):message='正在采集清零样本；等 zeroed=true 再按 p'
-
-                    zero_pending=False
-
             if quitting and not pending:
 
-                if latest.get('stage') in ('COMPLETE','IDLE') or latest.get('driver_disabled_confirmed'):
+                if latest.get('stage') in ('READY','PRELOAD','RISE','SETTLE','RECORD','PEAK','FALL'):
+                    pending_op='unload';pending=pool.submit(request,pending_op)
 
-                    pending=pool.submit(request,'shutdown');quitting=False;message='退出中'
+                elif latest.get('stage') in ('COMPLETE','IDLE') or latest.get('driver_disabled_confirmed'):
+
+                    pending_op='shutdown';pending=pool.submit(request,pending_op);quitting=False;shutdown_requested=True;message='退出中'
 
                 elif latest.get('state')=='FAULT':
 
@@ -410,19 +455,7 @@ def terminal(path):
 
                 elif key=='q':
 
-                    if not pending:
-
-                        if latest.get('stage') in ('READY','PRELOAD'):
-
-                            pending=pool.submit(request,'unload');quitting=True
-
-                        elif latest.get('stage')=='RETRACT':quitting=True
-
-                        elif latest.get('stage') in ('IDLE','COMPLETE') or latest.get('driver_disabled_confirmed'):
-
-                            pending=pool.submit(request,'shutdown')
-
-                        else:message='仍受载或停止未确认，请先急停并检查'
+                    quitting=True
 
                 elif not pending and key=='c':
 
@@ -440,55 +473,54 @@ def terminal(path):
 
                             candidate_config=candidate
 
-                            pending=pool.submit(request,'configure',controller_config(candidate))
+                            pending_op='configure';pending=pool.submit(request,pending_op,controller_config(candidate))
 
                             message='正在重读 '+json.dumps(candidate['experiment'],ensure_ascii=False)
 
-                elif not pending and key in ('z','p','s','u','r'):
+                elif not pending and key in ('p','s','u','r'):
 
-                    if key=='p':
-
-                        snapshot=csv_path.with_name(csv_path.stem+'.config.'+uuid.uuid4().hex[:8]+'.yaml')
-
-                        with snapshot.open('x',encoding='utf-8') as stream:yaml.safe_dump(config,stream,allow_unicode=True,sort_keys=False)
-
-                    zero_pending=key=='z'
-
-                    pending=pool.submit(request,{'z':'force-zero','p':'preload','s':'experiment-start','u':'unload','r':'reset'}[key])
+                    pending_op={'p':'preload','s':'experiment-start','u':'unload','r':'reset'}[key]
+                    pending=pool.submit(request,pending_op)
 
             if not pending and time.monotonic()>=next_status:
 
-                pending=pool.submit(request,'status');next_status=time.monotonic()+.1
+                pending_op='status';pending=pool.submit(request,pending_op);next_status=time.monotonic()+.5
 
-            if latest:
+            if latest and time.monotonic()>=next_display:
+
+                next_display=time.monotonic()+.5
 
                 line=(f"{latest.get('state')} {latest.get('stage')} fault={latest.get('fault')} "
 
                     f"x={latest.get('position_mm',0):.3f}mm v={latest.get('velocity_mm_s',0):.3f}mm/s "
 
-                    f"F={latest.get('force_n',0):.2f}N raw={latest.get('force_raw_n',0):.2f}N "
 
-                    f"effort={latest.get('effort',0):.3f} Icmd=0A Iactual=NA "
+                    f"Iraw6077={latest.get('current_raw_6077',0):.0f}raw Icmd={latest.get('commanded_current_raw',0):.0f}raw level={latest.get('level',0)} "
 
-                    f"zeroed={latest.get('zeroed')} age={latest.get('force_age_ms',0):.1f}ms "
 
-                    f"rx={latest.get('receive_hz',0):.1f}Hz disabled={latest.get('driver_disabled_confirmed')} | {message}")
+                    f"recording={latest.get('recording')} CSV={latest.get('csv_path','')} disabled={latest.get('driver_disabled_confirmed')} | {message}")
 
                 print('\r\x1b[2K'+line,end='',flush=True)
 
-        print('\ncontroller exited; inspect summary and daemon log')
-
     finally:
 
-        try:urgent('E')
+        beat_done.set()
+        try:
+            try:
+                termios.tcsetattr(sys.stdin,termios.TCSADRAIN,original)
+            except (OSError, termios.error):
+                pass  # The terminal may already be closed (SIGHUP).
+            if process.poll() is None:
+                try:print('\n正在停止 controller、保存记录并清理会话…', flush=True)
+                except OSError:pass
+            stop_controller(process)
+        finally:
+            if beat_thread.ident is not None:
+                beat_thread.join(timeout=1)
+            if pool is not None:
+                pool.shutdown(wait=True,cancel_futures=True)
 
-        except OSError:pass
-
-        termios.tcsetattr(sys.stdin,termios.TCSADRAIN,original)
-
-        beat_done.set();beat_thread.join(timeout=1)
-
-        pool.shutdown(wait=True,cancel_futures=True)
+    print('controller exited; inspect summary and daemon log')
 
 
 def main():
@@ -501,7 +533,7 @@ def main():
 
     options=exp.add_mutually_exclusive_group();options.add_argument('--check-config',action='store_true');options.add_argument('--preview',metavar='CSV')
 
-    exp.add_argument('--preview-initial-a',type=float,default=0)
+    exp.add_argument('--preview-initial-raw',type=float,default=0)
 
     for op in ('status','force','force-zero','preload','unload','reset','disable','shutdown','estop'):
 
@@ -515,15 +547,23 @@ def main():
 
             if args.check_config:print(json.dumps(controller_config(load_config(args.config)),indent=2,allow_nan=False))
 
-            elif args.preview:print(preview(load_config(args.config),args.preview,args.preview_initial_a))
+            elif args.preview:print(preview(load_config(args.config),args.preview,args.preview_initial_raw))
 
-            else:terminal(args.config)
+            else:
+                handlers={sig:signal.signal(sig,interrupt_terminal) for sig in (signal.SIGTERM,signal.SIGHUP)}
+                try:terminal(args.config)
+                finally:
+                    for sig,handler in handlers.items():signal.signal(sig,handler)
 
             return 0
 
         if args.op=='estop':urgent('E');print('急停已请求；用 status 检查驱动确认');return 0
 
         response=request(args.op);print(json.dumps(response,indent=2,ensure_ascii=False));return 0 if response['ok'] else 2
+
+    except KeyboardInterrupt:
+
+        print('终端已中断；controller 清理完成。',file=sys.stderr);return 130
 
     except (OSError,ValueError,RuntimeError) as error:
 

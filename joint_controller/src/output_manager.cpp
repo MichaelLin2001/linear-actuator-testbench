@@ -7,4 +7,10 @@ TargetWriteStatus OutputManager::write_csp(double position) noexcept {
     } else { ++failures_; ++consecutive_failures_; }
     return status;
 }
+TargetWriteStatus OutputManager::write_cst(double raw) noexcept {
+    const auto status=adapter_.write_cst(raw);
+    if(status==TargetWriteStatus::Ok)consecutive_failures_=0;
+    else{++failures_;++consecutive_failures_;}
+    return status;
+}
 }  // namespace jc

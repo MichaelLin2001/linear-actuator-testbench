@@ -6,12 +6,12 @@ namespace jc {
 enum class ZeroState : std::uint8_t { None, Collecting, Complete, Failed };
 struct ProcessedForce {
     double raw{}, zero{}, external{};
-    std::uint64_t timestamp_ns{}, zero_samples{};
+    std::uint64_t timestamp_ns{}, zero_samples{}, sample_sequence{}, session_id{}, zero_version{};
     std::uint16_t package_no{};
     ZeroState zero_state{ZeroState::None};
     bool valid{}, zeroed{}, new_sample{};
 };
-// Owned exclusively by ControlLoop. Commands and status cross threads separately.
+// Owned exclusively by the force sensor process.
 class ForceProcessor {
 public:
     static constexpr std::uint64_t timeout_ns=100'000'000;

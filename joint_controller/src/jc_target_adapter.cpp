@@ -8,8 +8,8 @@
 
 namespace jc {
 namespace {
-constexpr char kTargetKeyFile[] = "/home/jc_robot/target_handle";
-constexpr char kTargetSemaphore[] = "sem_target_handle_mutex";
+constexpr char kTargetKeyFile[] = "/tmp/j3-testbench/target_handle";
+constexpr char kTargetSemaphore[] = "/j3_testbench_target_mutex";
 }
 
 JcTargetAdapter::~JcTargetAdapter() {
@@ -63,9 +63,8 @@ bool JcTargetAdapter::attach(std::string& error) {
     return true;
 }
 
-TargetWriteStatus JcTargetAdapter::write_csp(std::size_t joint,
-                                              double position_si) noexcept {
-    if (joint != kJ3 || !std::isfinite(position_si)) {
+TargetWriteStatus JcTargetAdapter::write(std::size_t joint,double value,bool cst) noexcept {
+    if (joint != kJ3 || !std::isfinite(value)||(cst&&std::abs(value)>32767)) {
         return TargetWriteStatus::InvalidJoint;
     }
     if (target_address_ == nullptr || target_semaphore_ == SEM_FAILED) {
@@ -84,7 +83,7 @@ TargetWriteStatus JcTargetAdapter::write_csp(std::size_t joint,
     auto* const slots = static_cast<RawTarget*>(target_address_);
     RawTarget target{};
     std::memcpy(&target, slots + joint, sizeof(target));
-    target = csp_target(target, position_si);
+    target = cst?cst_target(target,value):csp_target(target,value);
     std::memcpy(slots + joint, &target, sizeof(target));
 
     if (sem_post(target_semaphore_) != 0) {

@@ -4,52 +4,73 @@
 #include <cstdint>
 
 namespace jc {
-enum class ExperimentStage : unsigned { Idle, Preload, Ready, Rise, Settle, Record, Peak, Fall, Unload, Retract, Complete, Fault };
+enum class ExperimentStage : unsigned { Idle, Preload, Ready, Rise, Settle, Record, Peak, Fall, Unload, Retract, Complete, Fault, SwitchingCst, SwitchingCsp };
 inline const char* stage_name(ExperimentStage s) noexcept {
-    constexpr const char* names[]={"IDLE","PRELOAD","READY","RISE","SETTLE","RECORD","PEAK","FALL","UNLOAD","RETRACT","COMPLETE","FAULT"};
+    constexpr const char* names[]={"IDLE","PRELOAD","READY","RISE","SETTLE","RECORD","PEAK","FALL","UNLOAD","RETRACT","COMPLETE","FAULT","SWITCHING_CST","SWITCHING_CSP"};
     return names[static_cast<unsigned>(s)];
 }
 struct ExperimentConfig {
     int direction{}; // Signed position direction, verified on this installation.
     bool linear{};
+    bool relative_position{true};
     unsigned levels{5};
-    double max_current_a{}, transition_s{1}, settle_s{1}, record_s{3};
+    double max_current_raw{}, transition_s{1}, settle_s{1}, record_s{3};
     double rise_s{10}, peak_hold_s{3}, fall_s{10};
     double preload_speed{}, contact_force_n{}, contact_confirm_s{0.3}, max_travel{}, preload_timeout_s{};
-    double unload_slew_a_s{}, retract_distance{}, retract_speed{};
-    double current_limit_a{}, force_limit_n{}, position_min{}, position_max{}, velocity_limit{}, contact_displacement{};
+    double unload_slew_raw_s{}, retract_distance{}, retract_speed{};
+    double current_limit_raw{}, force_limit_n{}, position_min{}, position_max{}, velocity_limit{}, contact_displacement{};
     double force_timeout_s{0.1}, experiment_timeout_s{}, heartbeat_timeout_s{1};
 };
+inline double position_coordinate(const ExperimentConfig& c,double origin,double absolute) noexcept {
+    return c.relative_position?absolute-origin:absolute;
+}
+inline double absolute_position(const ExperimentConfig& c,double origin,double coordinate) noexcept {
+    return c.relative_position?origin+coordinate:coordinate;
+}
 inline bool valid_experiment(const ExperimentConfig& c) noexcept {
-    const double positive[]={c.max_current_a,c.transition_s,c.record_s,c.rise_s,c.peak_hold_s,c.fall_s,
+    const double positive[]={c.max_current_raw,c.transition_s,c.record_s,c.rise_s,c.peak_hold_s,c.fall_s,
         c.preload_speed,c.contact_force_n,c.contact_confirm_s,c.max_travel,c.preload_timeout_s,
-        c.unload_slew_a_s,c.retract_distance,c.retract_speed,c.current_limit_a,c.force_limit_n,
+        c.unload_slew_raw_s,c.retract_distance,c.retract_speed,c.current_limit_raw,c.force_limit_n,
         c.velocity_limit,c.contact_displacement,c.force_timeout_s,c.experiment_timeout_s,c.heartbeat_timeout_s};
     for(double v:positive) if(!std::isfinite(v)||v<=0) return false;
     return (c.direction==1||c.direction==-1)&&c.levels>0&&c.levels<=1000&&
         std::isfinite(c.settle_s)&&c.settle_s>=0&&std::isfinite(c.position_min)&&std::isfinite(c.position_max)&&
-        c.position_min<c.position_max&&c.max_current_a<=c.current_limit_a&&c.contact_force_n<c.force_limit_n&&
+        c.position_min<c.position_max&&c.max_current_raw<=c.current_limit_raw&&c.current_limit_raw<=32767&&
+        std::floor(c.max_current_raw)==c.max_current_raw&&std::floor(c.current_limit_raw)==c.current_limit_raw&&c.contact_force_n<c.force_limit_n&&
         c.preload_speed<=c.velocity_limit&&c.retract_speed<=c.velocity_limit&&
         c.contact_displacement<=c.max_travel&&c.force_timeout_s<=1&&c.heartbeat_timeout_s<=5;
 }
-struct CurrentPoint { double magnitude_a{}; ExperimentStage stage{ExperimentStage::Idle}; unsigned level{}; bool done{}; };
+// Continue advancing during confirmation; hold the measured position only once confirmed.
+inline bool advance_preload(const ExperimentConfig& c,std::uint64_t now,std::uint64_t dt_ns,
+                            double force,double position,std::uint64_t& contact_since,double& reference) noexcept {
+    if(std::abs(force)>=c.contact_force_n){
+        if(!contact_since)contact_since=now;
+        if(static_cast<double>(now-contact_since)*1e-9>=c.contact_confirm_s){reference=position;return true;}
+    }else contact_since=0;
+    reference+=static_cast<double>(c.direction)*c.preload_speed*static_cast<double>(dt_ns)*1e-9;
+    return false;
+}
+inline bool heartbeat_fresh(std::uint64_t heartbeat,std::uint64_t checked_at,double timeout_s) noexcept {
+    return heartbeat!=0&&checked_at>=heartbeat&&static_cast<double>(checked_at-heartbeat)*1e-9<=timeout_s;
+}
+struct CurrentPoint { double magnitude_raw{}; ExperimentStage stage{ExperimentStage::Idle}; unsigned level{}; bool done{}; };
 // A pure clock-based profile: controller owns execution; no UI streaming of setpoints.
 class CurrentTrajectory {
 public:
-    bool start(const ExperimentConfig& c,double preload_a) noexcept {
-        if(!valid_experiment(c)||!std::isfinite(preload_a)||preload_a<0||preload_a>=c.max_current_a) return false;
-        c_=c;initial_=preload_a;active_=true;return true;
+    bool start(const ExperimentConfig& c,double preload_raw) noexcept {
+        if(!valid_experiment(c)||!std::isfinite(preload_raw)||preload_raw<0||preload_raw>=c.max_current_raw) return false;
+        c_=c;initial_=preload_raw;active_=true;return true;
     }
     void cancel() noexcept { active_=false; }
     CurrentPoint sample(double t) const noexcept {
         if(!active_||!std::isfinite(t)||t<0) return {0,ExperimentStage::Fault,0,true};
-        const double span=c_.max_current_a-initial_;
+        const double span=c_.max_current_raw-initial_;
         if(c_.linear) {
             if(t<c_.rise_s) return {initial_+span*t/c_.rise_s,ExperimentStage::Rise,0,false};
             t-=c_.rise_s;
-            if(t<c_.peak_hold_s) return {c_.max_current_a,ExperimentStage::Peak,0,false};
+            if(t<c_.peak_hold_s) return {c_.max_current_raw,ExperimentStage::Peak,0,false};
             t-=c_.peak_hold_s;
-            if(t<c_.fall_s) return {c_.max_current_a-span*t/c_.fall_s,ExperimentStage::Fall,0,false};
+            if(t<c_.fall_s) return {c_.max_current_raw-span*t/c_.fall_s,ExperimentStage::Fall,0,false};
         } else {
             const double block=c_.transition_s+c_.settle_s+c_.record_s;
             const double total=2*static_cast<double>(c_.levels)*block;

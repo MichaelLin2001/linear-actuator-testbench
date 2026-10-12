@@ -6,6 +6,7 @@
 #include "joint_controller/state_machine.hpp"
 #include "joint_controller/trajectory_generator.hpp"
 #include "joint_controller/atomic_snapshot.hpp"
+#include "joint_controller/force_shm.hpp"
 #include <atomic>
 #include <thread>
 namespace jc {
@@ -15,11 +16,12 @@ struct ControlStatus {
     ProcessedForce force{}; std::uint64_t acknowledged_sequence{},zero_sequence{},experiment_id{};
     CommandResult command_result{CommandResult::None};
     double actual_position{},actual_velocity{},effort{},reference_position{};
+    double commanded_current_raw{};unsigned level{};
     bool stationary{},configured{},feedback_valid{};
 };
 class ControlLoop {
 public:
-    ControlLoop(JcShmAdapter&,CommandManager&,DataLogger&,LoopConfig,OutputManager* =nullptr,ForceSensorReader* =nullptr) noexcept;
+    ControlLoop(JcShmAdapter&,CommandManager&,DataLogger&,LoopConfig,OutputManager* =nullptr,ForceShm* =nullptr) noexcept;
     ~ControlLoop();
     bool start(std::string& error);
     void request_stop() noexcept { stop_.store(true); }
@@ -31,8 +33,8 @@ public:
 private:
     void worker() noexcept;
     JcShmAdapter& adapter_; CommandManager& commands_; DataLogger& logger_;
-    LoopConfig config_; OutputManager* output_; ForceSensorReader* sensor_;
-    ForceProcessor force_{}; DryRunControllerState reset_{}; StateMachine state_;
+    LoopConfig config_; OutputManager* output_; ForceShm* sensor_;
+     DryRunControllerState reset_{}; StateMachine state_;
     TrajectoryGenerator trajectory_{}; ExperimentConfig experiment_{};
     AtomicSnapshot<ControlStatus> public_{}; LoopSummary summary_{};
     std::atomic<bool> stop_{},emergency_{},running_{}; std::atomic<std::uint64_t> heartbeat_ns_{};

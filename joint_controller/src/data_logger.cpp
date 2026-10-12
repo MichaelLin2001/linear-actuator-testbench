@@ -1,5 +1,6 @@
 #include "joint_controller/data_logger.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -12,14 +13,14 @@ constexpr const char* kStateNames[] = {"INIT", "IDLE", "ARMED", "RUN", "STOP", "
 constexpr const char* kFaultNames[] = {
     "NONE", "CONSECUTIVE_READ_FAILURES", "SNAPSHOT_READ_TIMEOUT", "NONFINITE_FEEDBACK",
     "SEMAPHORE_RELEASE_ERROR", "CLOCK_ERROR", "SLEEP_ERROR", "LOGGER_ERROR",
-    "TRACKING_ERROR", "TARGET_WRITE_ERROR", "FORCE_SENSOR_TIMEOUT", "EXPERIMENT_SAFETY", "EMERGENCY_STOP", "HEARTBEAT_TIMEOUT"};
+    "TRACKING_ERROR", "TARGET_WRITE_ERROR", "FORCE_SENSOR_INVALID_OR_ZERO_CHANGED", "EXPERIMENT_SAFETY", "EMERGENCY_STOP", "HEARTBEAT_TIMEOUT"};
 constexpr const char* kReadNames[] = {
     "OK", "CONTENDED", "INTERRUPTED", "SEMAPHORE_ERROR", "RELEASE_ERROR", "NOT_ATTACHED", "CLOCK_ERROR"};
-constexpr const char* kCommandNames[] = {"NONE", "ARM", "RUN", "STOP", "RESET", "MOVE", "FORCE_ZERO", "CONFIGURE", "PRELOAD", "UNLOAD"};
+constexpr const char* kCommandNames[] = {"NONE", "ARM", "RUN", "STOP", "RESET", "MOVE", "FORCE_ZERO", "CONFIGURE", "PRELOAD", "UNLOAD", "BEGIN_LOAD", "COMMIT_LOAD", "RESUME_CSP"};
 constexpr const char* kResultNames[] = {
     "NONE", "ACCEPTED", "REJECTED_STATE", "REJECTED_FEEDBACK", "REJECTED_VELOCITY",
     "REJECTED_ARGUMENT"};
-constexpr const char* kModeNames[] = {"READ_ONLY_DRY_RUN", "CSP_BUILTIN"};
+constexpr const char* kModeNames[] = {"READ_ONLY_DRY_RUN", "CSP_BUILTIN", "CST_RAW"};
 constexpr const char* kPhaseNames[] = {
     "IDLE", "INITIAL_HOLD", "OUTBOUND", "TARGET_HOLD", "RETURN", "FINAL_HOLD",
     "COMPLETE", "STOPPED"};
@@ -47,7 +48,7 @@ private:
 };
 
 void write_header(std::FILE* file) {
-    std::fputs("cycle_index,scheduled_wakeup_ns,actual_wakeup_ns,wakeup_jitter_ns,"
+    std::fputs("record_time_s,cycle_index,scheduled_wakeup_ns,actual_wakeup_ns,wakeup_jitter_ns,"
                "actual_dt_valid,actual_dt_ns,feedback_read_duration_ns,cycle_execution_ns,"
                "deadline_miss,skipped_before_cycle,skipped_after_cycle,snapshot_read_ok,"
                "snapshot_read_timestamp_ns,snapshot_read_age_ns,snapshot_read_timeout,"
@@ -61,15 +62,17 @@ void write_header(std::FILE* file) {
                "actual_velocity,submitted_csp_position,target_write_ok,target_write_failures,"
                "tracking_error,trajectory_complete,actual_at_target,"
                "force_raw,force_zero,force_external,force_package_no,force_timestamp_ns,force_valid,force_new_sample,force_zeroed,"
-               "experiment_id,experiment_stage,experiment_direction,experiment_level,commanded_current_a,actual_current_a,actual_current_valid", file);
+               "experiment_id,experiment_stage,experiment_direction,experiment_level,commanded_current_raw,actual_current_raw,actual_current_valid", file);
     for (std::size_t i = 0; i < kJointCount; ++i) {
-        std::fprintf(file, ",j%zu_q,j%zu_v,j%zu_effort,j%zu_hold_q,j%zu_pending_effort", i, i, i, i, i);
+        if(i==kJ3)std::fputs(",j3_q,j3_v,j3_current_raw_6077,j3_hold_q,j3_pending_effort",file);
+        else std::fprintf(file, ",j%zu_q,j%zu_v,j%zu_effort,j%zu_hold_q,j%zu_pending_effort", i, i, i, i, i);
     }
-    std::fputs(",force_age_ns\n",file);
+    std::fputs(",force_age_ns,force_sample_sequence,force_session_id,force_zero_version,heartbeat_timestamp_ns,heartbeat_check_timestamp_ns,heartbeat_age_ns\n",file);
 }
 
-void write_record(std::FILE* file, const CycleRecord& record) {
+void write_record(std::FILE* file, const CycleRecord& record,std::uint64_t start) {
     CsvRow row(file);
+    row.real(static_cast<double>(record.actual_wakeup_ns-start)*1e-9);
     row.number(record.cycle_index);
     row.number(record.scheduled_wakeup_ns);
     row.number(record.actual_wakeup_ns);
@@ -128,8 +131,8 @@ void write_record(std::FILE* file, const CycleRecord& record) {
     row.number(record.force.valid);row.number(record.force.new_sample);row.number(record.force.zeroed);
     row.number(record.experiment_id);row.text(stage_name(record.experiment_stage));
     row.signed_number(record.experiment_direction);row.number(record.experiment_level);
-    row.real(record.commanded_current_a);
-    if(record.actual_current_valid)row.real(record.actual_current_a);else row.empty();
+    row.real(record.commanded_current_raw);
+    if(record.actual_current_valid)row.real(record.actual_current_raw);else row.empty();
     row.number(record.actual_current_valid);
     for (std::size_t i = 0; i < kJointCount; ++i) {
         if (record.feedback.snapshot_read_ok) {
@@ -142,8 +145,13 @@ void write_record(std::FILE* file, const CycleRecord& record) {
         row.real(record.hold_reference[i]);
         row.real(record.pending_effort[i]);
     }
-    if(record.force.timestamp_ns!=0&&record.actual_wakeup_ns>=record.force.timestamp_ns)
-        row.number(record.actual_wakeup_ns-record.force.timestamp_ns);
+    if(record.force.timestamp_ns!=0&&record.force_read_timestamp_ns>=record.force.timestamp_ns)
+        row.number(record.force_read_timestamp_ns-record.force.timestamp_ns);
+    else row.empty();
+    row.number(record.force.sample_sequence);row.number(record.force.session_id);row.number(record.force.zero_version);
+    row.number(record.heartbeat_timestamp_ns);row.number(record.heartbeat_check_timestamp_ns);
+    if(record.heartbeat_timestamp_ns&&record.heartbeat_check_timestamp_ns>=record.heartbeat_timestamp_ns)
+        row.number(record.heartbeat_check_timestamp_ns-record.heartbeat_timestamp_ns);
     else row.empty();
     row.end();
 }
@@ -160,11 +168,11 @@ void write_summary(std::FILE* file, const LoopSummary& summary, const LoopConfig
     const auto text = [file](const char* key, const char* value) {
         CsvRow row(file); row.text(key); row.text(value); row.end();
     };
-    text("execution_mode", config.output_enabled ? "CSP_BUILTIN" : "READ_ONLY_DRY_RUN");
+    text("execution_mode", config.output_enabled ? "CSP_PRELOAD_CST_RAW_LOADING" : "READ_ONLY_DRY_RUN");
     text("source_feedback_freshness", "UNKNOWN");
     text("source_feedback_timeout", "UNSUPPORTED");
     text("terminal_heartbeat", "ENFORCED_DURING_OUTPUT");
-    text("driver_process_watchdog", "UNCONFIRMED");
+    text("driver_process_watchdog", "CST_TARGET_SEQUENCE_100MS");
     text("command_timeout", "UNSUPPORTED");
     number("active_joint_mask", config.state.active_mask);
     number("period_ns", kPeriodNs);
@@ -218,26 +226,33 @@ void DataLogger::set_io_error(int error) noexcept {
 }
 
 bool DataLogger::start(const std::string& path, const LoopConfig& config, std::string& error) {
-    config_ = config;
+    if(thread_.joinable()){error="recording already active";return false;}
+    config_ = config;startup_done_=false;finish_requested_.store(false);io_error_.store(0);dropped_.store(0);
+    records_=std::make_unique<SpscRing<CycleRecord,kLogCapacity>>();
     thread_ = std::thread(&DataLogger::worker, this, path);
     std::unique_lock<std::mutex> lock(startup_mutex_);
     startup_cv_.wait(lock, [this] { return startup_done_; });
     if (io_error() != 0) {
         error = std::string("CSV logger initialization failed: ") + std::strerror(io_error());
-        return false;
+        finish(LoopSummary{});return false;
     }
-    return true;
+    active_.store(true);return true;
 }
 
 CycleRecord* DataLogger::reserve_record() noexcept {
+    if(!active_.load())return nullptr;
+    producing_.store(true);
+    if(!active_.load()){producing_.store(false);return nullptr;}
     auto* record = records_->reserve();
     if (record == nullptr) {
-        dropped_.fetch_add(1, std::memory_order_relaxed);
+        dropped_.fetch_add(1, std::memory_order_relaxed);producing_.store(false);
     }
     return record;
 }
 
 void DataLogger::finish(const LoopSummary& summary) {
+    active_.store(false);
+    while(producing_.load())std::this_thread::yield();
     if (thread_.joinable()) {
         summary_ = summary;
         finish_requested_.store(true, std::memory_order_release);
@@ -274,13 +289,33 @@ void DataLogger::worker(std::string path) {
         return;
     }
 
-    std::uint64_t formatted = 0;
+    std::uint64_t formatted = 0,first_time=0;
+    LoopSummary recorded{};
     CycleRecord record{};
     for (;;) {
         const bool finishing = finish_requested_.load(std::memory_order_acquire);
         if (records_->try_pop(record)) {
             if (io_error() == 0) {
-                write_record(file, record);
+                if(!first_time)first_time=record.actual_wakeup_ns;
+                write_record(file, record,first_time);
+                ++recorded.cycles;recorded.valid_cycles+=record.cycle_valid;
+                recorded.deadline_misses+=record.deadline_miss;
+                recorded.skipped_periods+=record.skipped_after_cycle;
+                if(record.actual_dt_valid){
+                    ++recorded.dt_samples;recorded.sum_actual_dt_ns+=record.actual_dt_ns;
+                    recorded.min_actual_dt_ns=std::min(recorded.min_actual_dt_ns,record.actual_dt_ns);
+                    recorded.max_actual_dt_ns=std::max(recorded.max_actual_dt_ns,record.actual_dt_ns);
+                }
+                recorded.sum_wakeup_jitter_ns+=record.wakeup_jitter_ns;
+                if(record.wakeup_jitter_ns>0)recorded.max_wakeup_jitter_ns=std::max(recorded.max_wakeup_jitter_ns,static_cast<std::uint64_t>(record.wakeup_jitter_ns));
+                recorded.sum_cycle_execution_ns+=record.cycle_execution_ns;
+                recorded.max_cycle_execution_ns=std::max(recorded.max_cycle_execution_ns,record.cycle_execution_ns);
+                ++recorded.reads.total_reads;
+                recorded.reads.successful_reads+=record.feedback.snapshot_read_ok;
+                recorded.reads.failed_reads+=!record.feedback.snapshot_read_ok;
+                recorded.reads.consecutive_failed_reads=record.reads.consecutive_failed_reads;
+                recorded.reads.semaphore_contention_count+=record.feedback.read_status==ReadStatus::Contended;
+                recorded.reads.maximum_read_duration_ns=std::max(recorded.reads.maximum_read_duration_ns,record.feedback.snapshot_read_duration_ns);
                 if (std::ferror(file) != 0) {
                     set_io_error(errno);
                 } else {
@@ -297,7 +332,8 @@ void DataLogger::worker(std::string path) {
         }
     }
     if (std::fclose(file) != 0) { set_io_error(errno); }
-    write_summary(summary_file, summary_, config_, dropped_records(), formatted, io_error());
+    recorded.final_state=summary_.final_state;recorded.final_fault=summary_.final_fault;
+    write_summary(summary_file, recorded, config_, dropped_records(), formatted, io_error());
     if (std::fclose(summary_file) != 0) { set_io_error(errno); }
 }
 

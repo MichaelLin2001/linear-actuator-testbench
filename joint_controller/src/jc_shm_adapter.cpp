@@ -8,8 +8,8 @@
 
 namespace jc {
 namespace {
-constexpr char kFeedbackKeyFile[] = "/home/jc_robot/feedback_handle";
-constexpr char kFeedbackSemaphore[] = "sem_feedback_handle_mutex";
+constexpr char kFeedbackKeyFile[] = "/tmp/j3-testbench/feedback_handle";
+constexpr char kFeedbackSemaphore[] = "/j3_testbench_feedback_mutex";
 
 std::uint64_t now_ns() noexcept {
     timespec value{};

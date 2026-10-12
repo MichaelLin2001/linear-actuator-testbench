@@ -32,6 +32,14 @@ inline RawTarget csp_target(RawTarget previous,double position_m) noexcept {
     return previous;
 }
 
+inline RawTarget cst_target(RawTarget previous,double raw) noexcept {
+    previous.run_mode=10;previous.target_speed=0;previous.target_effort=static_cast<float>(std::round(raw));
+    const auto sequence=static_cast<std::uint16_t>((static_cast<unsigned>(previous.reserved[0])|
+        (static_cast<unsigned>(previous.reserved[1])<<8))+1U);
+    previous.reserved[0]=static_cast<std::uint8_t>(sequence);previous.reserved[1]=static_cast<std::uint8_t>(sequence>>8);
+    return previous;
+}
+
 enum class TargetWriteStatus : std::uint8_t {
     Ok,
     Contended,
@@ -50,9 +58,11 @@ public:
     JcTargetAdapter& operator=(const JcTargetAdapter&) = delete;
 
     bool attach(std::string& error);
-    TargetWriteStatus write_csp(std::size_t joint, double position_si) noexcept;
+    TargetWriteStatus write_csp(std::size_t joint, double position_si) noexcept { return write(joint,position_si,false); }
+    TargetWriteStatus write_cst(double raw) noexcept { return write(kJ3,raw,true); }
 
 private:
+    TargetWriteStatus write(std::size_t joint,double value,bool cst) noexcept;
     void* target_address_{};
     sem_t* target_semaphore_{SEM_FAILED};
 };

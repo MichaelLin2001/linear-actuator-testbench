@@ -117,6 +117,9 @@ CommandResult StateMachine::step(const FeedbackSnapshot& feedback, const ReadSta
     case CommandType::ForceZero:
     case CommandType::Configure:
     case CommandType::Preload:
+    case CommandType::BeginLoad:
+    case CommandType::CommitLoad:
+    case CommandType::ResumeCsp:
     case CommandType::Unload:
         return state_ != State::Fault ? CommandResult::Accepted : CommandResult::RejectedState;
     }
