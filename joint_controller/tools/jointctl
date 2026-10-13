@@ -359,6 +359,70 @@ def start(config):
         raise
 
 
+
+class StepDisplay:
+    def __init__(self):
+        self.last=None
+        self.recording=False
+        self.descending=False
+        self.early=False
+        self.loaded=False
+        self.path=''
+
+    def update(self, status, config):
+        stage=status.get('stage');state=status.get('state')
+        if stage=='PRELOAD' and (self.last is None or self.last[0]!='PRELOAD'):
+            self.descending=False;self.early=False;self.loaded=False
+        if stage=='FALL':self.descending=True
+        if stage in ('RISE','SETTLE','RECORD','PEAK','FALL'):self.loaded=True
+        recording=status.get('recording',False)
+        lines=[]
+        if recording and not self.recording:
+            self.path=status.get('csv_path','')
+            lines+=['记录已开始', '数据文件：'+self.path]
+        self.recording=recording
+        disabled=status.get('driver_disabled_confirmed',False)
+        fault=status.get('fault',0)
+        key=(stage,state,status.get('level',0),disabled,recording,
+             status.get('stationary',False) if stage=='READY' else False,fault)
+        if key==self.last:return lines
+        self.last=key
+        if state=='FAULT':
+            names={1:'反馈连续读取失败',2:'反馈快照超时',3:'反馈数值无效',4:'共享内存解锁失败',
+                   5:'时钟错误',6:'周期等待错误',7:'日志错误',8:'位置跟踪误差',9:'目标写入或驱动看门狗故障',
+                   10:'力反馈失效或清零发生变化',11:'实验安全保护',12:'急停',13:'终端心跳超时'}
+            lines.append(f'故障停止｜{names.get(fault,"未知故障")}（代码 {fault}）')
+            lines.append('驱动已失能' if disabled else '注意：驱动失能尚未确认')
+            lines.append('记录仍在收尾，请等待' if recording else '记录已结束；本轮未正常完成')
+            if not recording and self.path:lines.append('数据文件：'+self.path)
+            if disabled and not recording:lines.append('检查故障原因后按 r 复位，或 q 退出')
+        elif stage=='COMPLETE':
+            if disabled and not recording:
+                lines.append('提前卸载完成｜驱动已失能，记录已结束' if self.early else
+                             '本轮完成｜驱动已失能，记录已结束' if self.loaded else
+                             '预紧退离完成｜驱动已失能，记录已结束（未执行加载）')
+                if self.path:lines.append('数据文件：'+self.path)
+                lines.append('按 r 准备下一轮，或 q 退出')
+            else:lines.append('退离完成｜等待失能确认及记录收尾')
+        elif stage=='IDLE':lines.append('待机｜按 p 预紧，c 重读配置，q 退出')
+        elif stage=='PRELOAD':lines.append('预紧中｜正在寻找接触，请等待')
+        elif stage=='READY':lines.append('预紧完成｜保持位置，按 s 加载，或 u 卸载' if status.get('stationary') else '预紧接触已确认｜等待机构静止')
+        elif stage=='SWITCHING_CST':lines.append('加载启动中｜正在切换 CST')
+        elif stage in ('RISE','SETTLE','RECORD','PEAK','FALL'):
+            if config['experiment']['mode']=='linear':
+                lines.append('加载中｜'+{'RISE':'上升','PEAK':'峰值保持','FALL':'下降'}.get(stage,stage))
+            else:
+                action={'RISE':'上升','FALL':'下降','SETTLE':'稳定等待','RECORD':'采集数据','PEAK':'峰值保持'}[stage]
+                direction='下降' if self.descending else '上升'
+                level=status.get('level',0)
+                label=f'第 {level}/{config["staircase"]["levels"]} 档' if level else '回到预紧基线'
+                lines.append(f'加载中｜{direction} {label}：{action}')
+        elif stage=='UNLOAD':lines.append('卸载中｜目标逐渐降至零')
+        elif stage=='SWITCHING_CSP':lines.append('卸载目标已归零｜正在切回位置模式')
+        elif stage=='RETRACT':lines.append('退离中｜正在退出接触')
+        return lines
+
+
 def terminal(path):
 
     if os.name!='posix' or not sys.stdin.isatty():
@@ -391,116 +455,83 @@ def terminal(path):
 
     pool=None
 
-    pending=None; pending_op=None; latest={}; message=''; quitting=False; shutdown_requested=False; candidate_config=None
+    pending=None;pending_op=None;latest={};queued=None
+    quitting=False;shutdown_requested=False;candidate_config=None
+    display=StepDisplay()
+    labels={'preload':'预紧','experiment-start':'加载','unload':'卸载','reset':'复位','configure':'配置重读','shutdown':'退出'}
+    def say(text):print(text,flush=True)
 
     try:
-
         beat_thread.start()
         pool=concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
         configured=request('configure',controller_config(config))
-
         if not configured['ok']:raise RuntimeError(configured['message'])
-
+        latest=configured
         tty.setcbreak(sys.stdin)
-
-        print('c配置 p预加载 s加载 u卸载 空格/Esc急停 r复位 q退出（调零在力传终端）',flush=True)
-
-        print('s 执行实际 CST 加载：指令/反馈为原始单位，不是 A；u 降到零后切回位置模式退离。',flush=True)
-
-        print('正式记录从预紧开始；输出前缀: '+str(csv_path),flush=True)
-
+        say('操作：p预紧 s加载 u卸载 r复位 c配置 q退出；空格/Esc/Ctrl-C急停')
+        say('调零在力传终端；正式记录从预紧开始。加载数值单位为 raw。')
+        for line in display.update(latest,config):say(line)
         next_status=0.0
-        next_display=0.0
-
         while process.poll() is None:
-
             if pending and pending.done():
-
                 response=pending.result();pending=None;latest=response
-                if pending_op!='status':message=pending_op+': '+response.get('message','')
-                pending_op=None
-                if shutdown_requested and response.get('ok'):
-                    break
+                op=pending_op;pending_op=None
+                if op!='status':
+                    say(labels[op]+('请求已接受' if response.get('ok') else '被拒绝｜'+response.get('message','未知原因')))
+                    if op=='unload':
+                        if response.get('ok'):display.early=True
+                        else:quitting=False
+                if candidate_config is not None:
+                    if response.get('ok'):config=candidate_config
+                    candidate_config=None
+                for line in display.update(latest,config):say(line)
+                if shutdown_requested and response.get('ok'):break
                 shutdown_requested=False
 
-                if candidate_config is not None:
-
-                    if response.get('ok'):config=candidate_config
-
-                    candidate_config=None
-
             if quitting and not pending:
-
                 if latest.get('stage') in ('READY','PRELOAD','RISE','SETTLE','RECORD','PEAK','FALL'):
+                    say('退出前正在请求卸载')
                     pending_op='unload';pending=pool.submit(request,pending_op)
-
                 elif latest.get('stage') in ('COMPLETE','IDLE') or latest.get('driver_disabled_confirmed'):
-
-                    pending_op='shutdown';pending=pool.submit(request,pending_op);quitting=False;shutdown_requested=True;message='退出中'
-
+                    pending_op='shutdown';pending=pool.submit(request,pending_op)
+                    quitting=False;shutdown_requested=True;say('正在退出，请等待失能确认及记录收尾')
                 elif latest.get('state')=='FAULT':
-
-                    quitting=False;message='故障停止未确认，请按急停并检查驱动；不能假装已退出'
+                    quitting=False;say('故障停止未确认｜请按急停并检查驱动')
 
             ready,_,_=select.select([sys.stdin],[],[],.05)
-
             if ready:
-
                 key=sys.stdin.read(1)
-
                 if not key or key in (' ','\x1b','\x03'):
-
-                    urgent('E');message='急停已请求，等待驱动确认；不会自动退回'
-
+                    queued=None;quitting=False;urgent('E')
+                    say('急停已请求｜等待驱动确认，不会自动退回')
                 elif key=='q':
-
-                    quitting=True
-
-                elif not pending and key=='c':
-
-                    if latest.get('state')!='IDLE':message='只允许失能后的IDLE重读；先卸载、停止、复位'
-
+                    queued=None;quitting=True;say('退出请求已收到｜正在处理')
+                elif key in ('c','p','s','u','r'):
+                    if queued or quitting or (pending and pending_op!='status'):
+                        say('操作处理中｜本次按键未执行，请等待结果')
                     else:
+                        queued=key;say({'c':'配置重读','p':'预紧','s':'加载','u':'卸载','r':'复位'}[key]+'｜正在处理')
 
-                        candidate=load_config(path)
-
-                        if candidate['sensor']!=config['sensor'] or candidate['output']!=config['output']:
-
-                            message='设备或输出位置改变，需要退出后重启'
-
-                        else:
-
-                            candidate_config=candidate
-
-                            pending_op='configure';pending=pool.submit(request,pending_op,controller_config(candidate))
-
-                            message='正在重读 '+json.dumps(candidate['experiment'],ensure_ascii=False)
-
-                elif not pending and key in ('p','s','u','r'):
-
+            if queued and not pending:
+                key=queued;queued=None
+                if key=='c':
+                    if latest.get('state')!='IDLE' or not latest.get('driver_disabled_confirmed'):
+                        say('配置重读被拒绝｜请先卸载、确认失能并复位到 IDLE')
+                    else:
+                        try:
+                            candidate=load_config(path)
+                            if candidate['sensor']!=config['sensor'] or candidate['output']!=config['output']:
+                                say('配置重读被拒绝｜设备或输出位置改变，需要退出后重启')
+                            else:
+                                candidate_config=candidate;pending_op='configure'
+                                pending=pool.submit(request,pending_op,controller_config(candidate))
+                        except (OSError,ValueError,yaml.YAMLError) as error:
+                            say('配置重读被拒绝｜'+str(error))
+                else:
                     pending_op={'p':'preload','s':'experiment-start','u':'unload','r':'reset'}[key]
                     pending=pool.submit(request,pending_op)
-
             if not pending and time.monotonic()>=next_status:
-
                 pending_op='status';pending=pool.submit(request,pending_op);next_status=time.monotonic()+.5
-
-            if latest and time.monotonic()>=next_display:
-
-                next_display=time.monotonic()+.5
-
-                line=(f"{latest.get('state')} {latest.get('stage')} fault={latest.get('fault')} "
-
-                    f"x={latest.get('position_mm',0):.3f}mm v={latest.get('velocity_mm_s',0):.3f}mm/s "
-
-
-                    f"Iraw6077={latest.get('current_raw_6077',0):.0f}raw Icmd={latest.get('commanded_current_raw',0):.0f}raw level={latest.get('level',0)} "
-
-
-                    f"recording={latest.get('recording')} CSV={latest.get('csv_path','')} disabled={latest.get('driver_disabled_confirmed')} | {message}")
-
-                print('\r\x1b[2K'+line,end='',flush=True)
 
     finally:
 
@@ -520,7 +551,7 @@ def terminal(path):
             if pool is not None:
                 pool.shutdown(wait=True,cancel_futures=True)
 
-    print('controller exited; inspect summary and daemon log')
+    print('控制器已退出；实验结果见本轮汇总文件')
 
 
 def main():

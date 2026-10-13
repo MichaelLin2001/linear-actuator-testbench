@@ -41,6 +41,10 @@ else:
                     if not part:break
                     data+=part
                 request=json.loads(data)
+                with (root/'requests').open('a') as log:log.write(request['op']+'\n')
+                if request['op']=='status':
+                    (root/'polling').touch();time.sleep(.25)
+                if request['op']=='experiment-start':time.sleep(.3)
                 client.sendall(json.dumps(dict(ok=request['op']!='experiment-start',message='TEST LOAD REJECTED' if request['op']=='experiment-start' else 'accepted',state='IDLE',stage='IDLE',driver_disabled_confirmed=True)).encode())
                 if request['op']=='shutdown':stopped=True
     server.close();urgent.close()
@@ -82,12 +86,20 @@ def run_case(cli_source, profile, action, startup=False, repeat=False):
             if action=='q':
                 began=time.monotonic()
                 wait_until(lambda:time.monotonic()-began>=1.2)
-                assert 2<=output.count(b'\r\x1b[2K')<=3, 'status display must refresh at 2 Hz'
+                assert output.count('待机｜'.encode())==1 and b'\x1b[2K' not in output
+                (root/'polling').unlink(missing_ok=True)
+                wait_until(lambda:(root/'polling').exists())
                 os.write(master,b's')
+                wait_until(lambda:'加载｜正在处理'.encode() in output)
+                os.write(master,b's')
+                wait_until(lambda:'本次按键未执行'.encode() in output)
                 wait_until(lambda:b'TEST LOAD REJECTED' in output)
                 mark=len(output);began=time.monotonic()
                 wait_until(lambda:time.monotonic()-began>=1.2)
-                assert b'TEST LOAD REJECTED' in output[mark:], 'status poll erased command rejection'
+                assert len(output)==mark, 'unchanged status must remain silent'
+                assert (root/'requests').read_text().splitlines().count('experiment-start')==1
+                os.write(master,b' ')
+                wait_until(lambda:'急停已请求'.encode() in output)
                 os.write(master,b'q')
             else:os.kill(process.pid,action)
             if repeat:
@@ -114,7 +126,41 @@ def run_case(cli_source, profile, action, startup=False, repeat=False):
 def main():
     source=Path(sys.argv[1]) if len(sys.argv)>1 else Path(__file__).resolve().parents[1]/'tools/jointctl'
     profile=Path(sys.argv[2]) if len(sys.argv)>2 else Path(__file__).resolve().parents[1]/'profiles/experiment.yaml'
-    stop=runpy.run_path(str(source))['stop_controller']
+    module=runpy.run_path(str(source))
+    stop=module['stop_controller']
+    display=module['StepDisplay']()
+    config={'experiment':{'mode':'staircase'},'staircase':{'levels':5}}
+    status=dict(stage='IDLE',state='IDLE',driver_disabled_confirmed=True,recording=False)
+    def step(stage, **changes):
+        status.update(stage=stage,**changes)
+        return '\n'.join(display.update(status,config))
+    assert '待机' in step('IDLE')
+    assert not step('IDLE',force=123)
+    assert '数据文件：run.csv' in step('PRELOAD',state='PRELOAD',recording=True,csv_path='run.csv')
+    assert '等待机构静止' in step('READY')
+    assert '按 s 加载' in step('READY',stationary=True)
+    assert '上升 第 1/5 档' in step('RISE',level=1)
+    assert '稳定等待' in step('SETTLE')
+    assert '采集数据' in step('RECORD')
+    assert not step('RECORD',force=999)
+    assert '下降 第 4/5 档' in step('FALL',level=4)
+    assert '下降 第 4/5 档' in step('RECORD')
+    assert '回到预紧基线' in step('RECORD',level=0)
+    for stage in ('UNLOAD','SWITCHING_CSP','RETRACT'):assert step(stage)
+    assert '本轮完成' not in step('COMPLETE',driver_disabled_confirmed=False)
+    assert '本轮完成' not in step('COMPLETE',driver_disabled_confirmed=True)
+    assert '本轮完成' in step('COMPLETE',recording=False)
+    assert not step('COMPLETE')
+    step('PRELOAD',recording=True)
+    display.early=True
+    assert '提前卸载完成' in step('COMPLETE',recording=False)
+    fault=step('FAULT',state='FAULT',fault=11,driver_disabled_confirmed=False)
+    assert '实验安全保护' in fault and '失能尚未确认' in fault and '本轮完成' not in fault
+    assert '驱动已失能' in step('FAULT',driver_disabled_confirmed=True)
+    config['experiment']['mode']='linear'
+    for stage,label in [('RISE','上升'),('PEAK','峰值保持'),('FALL','下降')]:
+        assert label in step(stage,state='RUNNING',fault=0)
+
     previous=signal.getsignal(signal.SIGINT)
     for result in (4,subprocess.TimeoutExpired('fake-controller',30)):
         child=Mock(pid=123,poll=Mock(return_value=None))
